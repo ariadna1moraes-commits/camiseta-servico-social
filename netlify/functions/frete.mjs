@@ -141,9 +141,8 @@ export default async (req) => {
     const body = await req.json();
 
     const postalCode = String(
-      body.postalCode || ""
-    ).replace(/\D/g, "");
-
+  body.destinationCep || body.postalCode || ""
+).replace(/\D/g, "");
     const quantity = Math.max(
       1,
       Number(body.quantity || 1)
@@ -202,9 +201,15 @@ export default async (req) => {
     const data = await response.json();
 
     if (!response.ok) {
-      return new Response(
-        JSON.stringify({
-          error: "Não foi possível calcular o frete.",
+     return new Response(
+  JSON.stringify({
+    options: fretes.map((item) => ({
+      id: item.id,
+      name: item.nome,
+      price: item.valor,
+      deliveryTime: item.prazo,
+    })),
+  }),          error: "Não foi possível calcular o frete.",
           details: data,
         }),
         {
