@@ -4,17 +4,32 @@ export const config = {
   path: "/api/frete",
 };
 
-async function getTokens() {
+const JSON_HEADERS = {
+  "Content-Type": "application/json",
+};
+
+async function getStoredTokens() {
   const store = getStore("melhor-envio-auth");
-  return await store.get("tokens", { type: "json" });
+
+  return await store.get("tokens", {
+    type: "json",
+  });
 }
 
-async function refreshToken(tokens) {
+async function saveTokens(tokens) {
+  const store = getStore("melhor-envio-auth");
+
+  await store.setJSON("tokens", tokens);
+}
+
+async function refreshAccessToken(tokens) {
   const clientId = process.env.MELHOR_ENVIO_CLIENT_ID;
   const clientSecret = process.env.MELHOR_ENVIO_CLIENT_SECRET;
 
   if (!clientId || !clientSecret) {
-    throw new Error("Credenciais do Melhor Envio não configuradas.");
+    throw new Error(
+      "Credenciais do Melhor Envio não configuradas."
+    );
   }
 
   if (!tokens?.refresh_token) {
@@ -49,22 +64,21 @@ async function refreshToken(tokens) {
     );
   }
 
-  const store = getStore("melhor-envio-auth");
-
   const newTokens = {
     access_token: data.access_token,
-    refresh_token: data.refresh_token || tokens.refresh_token,
-    expires_in: data.expires_in,
+    refresh_token:
+      data.refresh_token || tokens.refresh_token,
+    expires_in: Number(data.expires_in || 0),
     created_at: Date.now(),
   };
 
-  await store.setJSON("tokens", newTokens);
+  await saveTokens(newTokens);
 
   return newTokens;
 }
 
-async function getValidToken() {
-  let tokens = await getTokens();
+async function getValidAccessToken() {
+  let tokens = await getStoredTokens();
 
   if (!tokens?.access_token) {
     throw new Error(
@@ -75,26 +89,36 @@ async function getValidToken() {
   const createdAt = Number(tokens.created_at || 0);
   const expiresIn = Number(tokens.expires_in || 0);
 
-  const expiresAt = createdAt + expiresIn * 1000;
+  if (createdAt && expiresIn) {
+    const expiresAt =
+      createdAt + expiresIn * 1000;
 
-  // Renova 5 minutos antes de expirar
-  if (
-    expiresIn > 0 &&
-    Date.now() >= expiresAt - 5 * 60 * 1000
-  ) {
-    tokens = await refreshToken(tokens);
+    const fiveMinutes =
+      5 * 60 * 1000;
+
+    if (
+      Date.now() >=
+      expiresAt - fiveMinutes
+    ) {
+      tokens = await refreshAccessToken(tokens);
+    }
   }
 
   return tokens.access_token;
 }
 
-async function calculateFreight(token, body, originCep, postalCode, quantity) {
+async function calculateFreight({
+  accessToken,
+  originCep,
+  destinationCep,
+  quantity,
+}) {
   return await fetch(
     "https://melhorenvio.com.br/api/v2/me/shipment/calculate",
     {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${token}`,
+        Authorization: `Bearer ${accessToken}`,
         Accept: "application/json",
         "Content-Type": "application/json",
         "User-Agent": "Camiseta Servico Social",
@@ -103,9 +127,11 @@ async function calculateFreight(token, body, originCep, postalCode, quantity) {
         from: {
           postal_code: originCep,
         },
+
         to: {
-          postal_code: postalCode,
+          postal_code: destinationCep,
         },
+
         products: [
           {
             id: "camiseta-servico-social",
@@ -122,6 +148,48 @@ async function calculateFreight(token, body, originCep, postalCode, quantity) {
   );
 }
 
+function formatFreightOptions(data) {
+  if (!Array.isArray(data)) {
+    return [];
+  }
+
+  return data
+    .filter(
+      (item) =>
+        !item.error &&
+        (item.price != null ||
+          item.custom_price != null)
+    )
+    .map((item) => ({
+      id: item.id,
+
+      name:
+        item.name ||
+        item.company?.name ||
+        "Opção de entrega",
+
+      price: Number(
+        item.custom_price ??
+          item.price ??
+          0
+      ),
+
+      deliveryTime: Number(
+        item.custom_delivery_time ??
+          item.delivery_time ??
+          0
+      ),
+
+      carrier:
+        item.company?.name ||
+        "",
+
+      service:
+        item.name ||
+        "",
+    }));
+}
+
 export default async (req) => {
   if (req.method !== "POST") {
     return new Response(
@@ -130,9 +198,7 @@ export default async (req) => {
       }),
       {
         status: 405,
-        headers: {
-          "Content-Type": "application/json",
-        },
+        headers: JSON_HEADERS,
       }
     );
   }
@@ -140,115 +206,117 @@ export default async (req) => {
   try {
     const body = await req.json();
 
-    const postalCode = String(
-  body.destinationCep || body.postalCode || ""
-).replace(/\D/g, "");
+    /*
+     * A página da loja envia destinationCep.
+     * Também aceitamos postalCode para manter compatibilidade.
+     */
+    const destinationCep = String(
+      body.destinationCep ||
+        body.postalCode ||
+        ""
+    ).replace(/\D/g, "");
+
     const quantity = Math.max(
       1,
       Number(body.quantity || 1)
     );
 
-    if (postalCode.length !== 8) {
+    if (destinationCep.length !== 8) {
       return new Response(
         JSON.stringify({
-          error: "CEP de destino inválido.",
+          error:
+            "CEP de destino inválido.",
         }),
         {
           status: 400,
-          headers: {
-            "Content-Type": "application/json",
-          },
+          headers: JSON_HEADERS,
         }
       );
     }
 
     const originCep = String(
-      process.env.MELHOR_ENVIO_ORIGIN_CEP || ""
+      process.env.MELHOR_ENVIO_ORIGIN_CEP ||
+        ""
     ).replace(/\D/g, "");
 
     if (originCep.length !== 8) {
-      throw new Error(
-        "CEP de origem não configurado."
-      );
-    }
-
-    let token = await getValidToken();
-
-    let response = await calculateFreight(
-      token,
-      body,
-      originCep,
-      postalCode,
-      quantity
-    );
-
-    // Se o token estiver inválido, renova e tenta novamente.
-    if (response.status === 401) {
-      const tokens = await getTokens();
-      const refreshedTokens = await refreshToken(tokens);
-
-      token = refreshedTokens.access_token;
-
-      response = await calculateFreight(
-        token,
-        body,
-        originCep,
-        postalCode,
-        quantity
-      );
-    }
-
-    const data = await response.json();
-
-    if (!response.ok) {
-     return new Response(
-  JSON.stringify({
-    options: fretes.map((item) => ({
-      id: item.id,
-      name: item.nome,
-      price: item.valor,
-      deliveryTime: item.prazo,
-    })),
-  }),          error: "Não foi possível calcular o frete.",
-          details: data,
+      return new Response(
+        JSON.stringify({
+          error:
+            "CEP de origem não configurado.",
         }),
         {
-          status: response.status,
-          headers: {
-            "Content-Type": "application/json",
-          },
+          status: 500,
+          headers: JSON_HEADERS,
         }
       );
     }
 
-    const fretes = Array.isArray(data)
-      ? data
-          .filter(
-            (item) =>
-              !item.error &&
-              (item.price || item.custom_price)
-          )
-          .map((item) => ({
-            id: item.id,
-            transportadora:
-              item.company?.name || item.name,
-            nome: item.name,
-            valor: Number(
-              item.custom_price ?? item.price
-            ),
-            prazo:
-              item.custom_delivery_time ??
-              item.delivery_time,
-          }))
-      : [];
+    let accessToken =
+      await getValidAccessToken();
+
+    let response =
+      await calculateFreight({
+        accessToken,
+        originCep,
+        destinationCep,
+        quantity,
+      });
+
+    /*
+     * Se o token estiver inválido,
+     * renovamos uma vez e repetimos a cotação.
+     */
+    if (response.status === 401) {
+      const tokens =
+        await getStoredTokens();
+
+      const refreshed =
+        await refreshAccessToken(tokens);
+
+      accessToken =
+        refreshed.access_token;
+
+      response =
+        await calculateFreight({
+          accessToken,
+          originCep,
+          destinationCep,
+          quantity,
+        });
+    }
+
+    const data =
+      await response.json();
+
+    if (!response.ok) {
+      return new Response(
+        JSON.stringify({
+          error:
+            "Não foi possível calcular o frete.",
+          details: data,
+        }),
+        {
+          status:
+            response.status || 500,
+          headers: JSON_HEADERS,
+        }
+      );
+    }
+
+    const options =
+      formatFreightOptions(data);
 
     return new Response(
-      JSON.stringify(fretes),
+      JSON.stringify({
+        options,
+      }),
       {
         status: 200,
         headers: {
-          "Content-Type": "application/json",
-          "Cache-Control": "no-store",
+          ...JSON_HEADERS,
+          "Cache-Control":
+            "no-store",
         },
       }
     );
@@ -256,14 +324,12 @@ export default async (req) => {
     return new Response(
       JSON.stringify({
         error:
-          error.message ||
+          error?.message ||
           "Erro interno ao calcular o frete.",
       }),
       {
         status: 500,
-        headers: {
-          "Content-Type": "application/json",
-        },
+        headers: JSON_HEADERS,
       }
     );
   }
